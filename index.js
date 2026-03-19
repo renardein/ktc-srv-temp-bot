@@ -54,6 +54,36 @@ if (!TELEGRAM_TOKEN || !CHAT_ID) {
 
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 
+// ——— Логирование TG API в консоль ———
+function tgLog(direction, method, data) {
+  const ts = new Date().toISOString();
+  console.log(`[TG API] ${ts} ${direction} ${method}`, data);
+}
+const origSendMessage = bot.sendMessage.bind(bot);
+bot.sendMessage = function (chatId, text, options) {
+  const preview = typeof text === 'string' ? text.slice(0, 120) : String(text).slice(0, 120);
+  tgLog('→', 'sendMessage', { chat_id: chatId, text_preview: preview + (preview.length >= 120 ? '…' : '') });
+  return origSendMessage(chatId, text, options)
+    .then((result) => {
+      tgLog('←', 'sendMessage', { chat_id: chatId, ok: true });
+      return result;
+    })
+    .catch((err) => {
+      tgLog('←', 'sendMessage', { chat_id: chatId, error: err.message });
+      throw err;
+    });
+};
+bot.on('message', (msg) => {
+  const text = msg.text || msg.caption || '';
+  tgLog('←', 'message', {
+    chat_id: msg.chat.id,
+    from_id: msg.from?.id,
+    from_username: msg.from?.username || null,
+    text: text.slice(0, 100) + (text.length > 100 ? '…' : ''),
+  });
+});
+// ———
+
 function getNested(obj, path) {
   return path.split('.').reduce((o, key) => (o && o[key] !== undefined ? o[key] : null), obj);
 }
