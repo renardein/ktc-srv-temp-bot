@@ -151,7 +151,6 @@ async function checkTemperature() {
     temp = await fetchTemperature();
   } catch (err) {
     console.error('Ошибка запроса к API температуры:', err.message);
-    sendAlert(`❌ Ошибка получения температуры: ${err.message}`);
     return;
   }
 
