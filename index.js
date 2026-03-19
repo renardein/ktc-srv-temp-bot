@@ -52,7 +52,7 @@ if (!TELEGRAM_TOKEN || !CHAT_ID) {
   process.exit(1);
 }
 
-const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
+const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: false });
 
 // ——— Логирование TG API в консоль ———
 function tgLog(direction, method, data) {
