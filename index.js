@@ -52,7 +52,7 @@ if (!TELEGRAM_TOKEN || !CHAT_ID) {
   process.exit(1);
 }
 
-const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: false });
+const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 
 function getNested(obj, path) {
   return path.split('.').reduce((o, key) => (o && o[key] !== undefined ? o[key] : null), obj);
@@ -65,6 +65,46 @@ async function fetchTemperature() {
     throw new Error(`Температура не найдена по пути "${TEMP_JSON_PATH}" в ответе API`);
   }
   return value;
+}
+
+/** Текущая температура + краткий статус для ответа в чат */
+async function getTemperatureReplyText() {
+  const temp = await fetchTemperature();
+  const over = temp > TEMP_THRESHOLD;
+  return (
+    `🌡 Температура: ${temp}°C\n` +
+    `📊 Порог: ${TEMP_THRESHOLD}°C\n` +
+    `${over ? '⚠️ Сейчас выше порога' : '✅ Сейчас не выше порога'}\n` +
+    `📌 Мониторинг: ${state === 'ALERTING' ? 'режим превышения' : 'норма'}`
+  );
+}
+
+function setupCommands() {
+  // В группах команда может быть /temp@BotName
+  bot.onText(/\/temp(?:@[\w_]+)?$/i, async (msg) => {
+    const chatId = msg.chat.id;
+    try {
+      const text = await getTemperatureReplyText();
+      await bot.sendMessage(chatId, text);
+    } catch (err) {
+      await bot.sendMessage(chatId, `❌ Не удалось получить температуру: ${err.message}`).catch(() => {});
+    }
+  });
+
+  bot.onText(/\/start(?:@[\w_]+)?$/i, async (msg) => {
+    await bot
+      .sendMessage(
+        msg.chat.id,
+        'Бот мониторит температуру и шлёт алерты в настроенный чат.\n\n' +
+          'Команды:\n' +
+          '/temp — текущая температура с API'
+      )
+      .catch(() => {});
+  });
+
+  bot.setMyCommands([{ command: 'temp', description: 'Текущая температура' }]).catch((err) => {
+    console.warn('setMyCommands:', err.message);
+  });
 }
 
 function sendAlert(message) {
@@ -150,6 +190,7 @@ async function checkTemperature() {
 
 function run() {
   loadPersistedState();
+  setupCommands();
   restoreRepeatAlertTimerIfAlerting();
   console.log(`Мониторинг: ${TEMP_API_URL}, порог ${TEMP_THRESHOLD}°C, опрос каждые ${POLL_INTERVAL_MS / 1000} с, состояние: ${STATE_FILE}`);
   checkTemperature();
