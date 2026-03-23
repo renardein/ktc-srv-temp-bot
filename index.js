@@ -1,22 +1,22 @@
 require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
-const TelegramBot = require('node-telegram-bot-api');
 const axios = require('axios');
+const { Bot } = require('@maxhub/max-bot-api');
 
 // ============ Конфигурация ============
-const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+const MAX_BOT_TOKEN = process.env.MAX_BOT_TOKEN || process.env.BOT_TOKEN;
+const MAX_ALERT_CHAT_ID = Number(process.env.MAX_ALERT_CHAT_ID);
 const TEMP_API_URL = process.env.TEMP_API_URL || 'http://192.168.4.252:9001/api/latest';
 const TEMP_THRESHOLD = Number(process.env.TEMP_THRESHOLD) || 50;
-const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS) || 60 * 1000;  // 1 мин
-const REPEAT_ALERT_INTERVAL_MS = 4 * 60 * 60 * 1000;  // 4 часа
-const TEMP_JSON_PATH = process.env.TEMP_JSON_PATH || '0.temperature';  // путь в JSON: массив → первый датчик → поле temperature
+const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS) || 60 * 1000; // 1 мин
+const REPEAT_ALERT_INTERVAL_MS = 4 * 60 * 60 * 1000; // 4 часа
+const TEMP_JSON_PATH = process.env.TEMP_JSON_PATH || '0.temperature';
 const STATE_FILE = path.resolve(process.env.STATE_FILE || path.join(__dirname, 'bot-state.json'));
 
 // ============ Состояние ============
-let state = 'NORMAL';  // NORMAL | ALERTING
-let lastAlertAt = null;  // ms epoch — время последнего алерта (первого или повторного)
+let state = 'NORMAL'; // NORMAL | ALERTING
+let lastAlertAt = null;
 let repeatAlertTimer = null;
 
 function loadPersistedState() {
@@ -47,45 +47,53 @@ function savePersistedState() {
   }
 }
 
-if (!TELEGRAM_TOKEN || !CHAT_ID) {
-  console.error('Укажите TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID в .env');
+if (!MAX_BOT_TOKEN) {
+  console.error('Укажите MAX_BOT_TOKEN (или BOT_TOKEN) в .env');
+  process.exit(1);
+}
+if (!Number.isFinite(MAX_ALERT_CHAT_ID)) {
+  console.error('Укажите MAX_ALERT_CHAT_ID — числовой id чата MAX для алертов');
   process.exit(1);
 }
 
-const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: false });
+const bot = new Bot(MAX_BOT_TOKEN);
 
-// ——— Логирование TG API в консоль ———
-function tgLog(direction, method, data) {
+// ——— Логирование MAX API в консоль ———
+function maxLog(direction, method, data) {
   const ts = new Date().toISOString();
-  console.log(`[TG API] ${ts} ${direction} ${method}`, data);
+  console.log(`[MAX API] ${ts} ${direction} ${method}`, data);
 }
-const origSendMessage = bot.sendMessage.bind(bot);
-bot.sendMessage = function (chatId, text, options) {
+const origSendMessageToChat = bot.api.sendMessageToChat.bind(bot.api);
+bot.api.sendMessageToChat = async function (chatId, text, extra) {
   const preview = typeof text === 'string' ? text.slice(0, 120) : String(text).slice(0, 120);
-  tgLog('→', 'sendMessage', { chat_id: chatId, text_preview: preview + (preview.length >= 120 ? '…' : '') });
-  return origSendMessage(chatId, text, options)
-    .then((result) => {
-      tgLog('←', 'sendMessage', { chat_id: chatId, ok: true });
-      return result;
-    })
-    .catch((err) => {
-      tgLog('←', 'sendMessage', { chat_id: chatId, error: err.message });
-      throw err;
-    });
-};
-bot.on('message', (msg) => {
-  const text = msg.text || msg.caption || '';
-  tgLog('←', 'message', {
-    chat_id: msg.chat.id,
-    from_id: msg.from?.id,
-    from_username: msg.from?.username || null,
-    text: text.slice(0, 100) + (text.length > 100 ? '…' : ''),
+  maxLog('→', 'sendMessageToChat', {
+    chat_id: chatId,
+    text_preview: preview + (preview.length >= 120 ? '…' : ''),
   });
+  try {
+    const message = await origSendMessageToChat(chatId, text, extra);
+    maxLog('←', 'sendMessageToChat', { chat_id: chatId, ok: true });
+    return message;
+  } catch (err) {
+    maxLog('←', 'sendMessageToChat', { chat_id: chatId, error: err.message });
+    throw err;
+  }
+};
+bot.use(async (ctx, next) => {
+  if (ctx.updateType === 'message_created' && ctx.message?.body) {
+    const text = ctx.message.body.text || '';
+    maxLog('←', 'message_created', {
+      chat_id: ctx.chatId,
+      user_id: ctx.user?.user_id,
+      text: text.slice(0, 100) + (text.length > 100 ? '…' : ''),
+    });
+  }
+  return next();
 });
 // ———
 
-function getNested(obj, path) {
-  return path.split('.').reduce((o, key) => (o && o[key] !== undefined ? o[key] : null), obj);
+function getNested(obj, pathStr) {
+  return pathStr.split('.').reduce((o, key) => (o && o[key] !== undefined ? o[key] : null), obj);
 }
 
 async function fetchTemperature() {
@@ -97,7 +105,6 @@ async function fetchTemperature() {
   return value;
 }
 
-/** Текущая температура + краткий статус для ответа в чат */
 async function getTemperatureReplyText() {
   const temp = await fetchTemperature();
   const over = temp > TEMP_THRESHOLD;
@@ -110,40 +117,40 @@ async function getTemperatureReplyText() {
 }
 
 function setupCommands() {
-  // В группах команда может быть /temp@BotName
-  bot.onText(/\/temp(?:@[\w_]+)?$/i, async (msg) => {
-    const chatId = msg.chat.id;
+  bot.command('temp', async (ctx) => {
     try {
       const text = await getTemperatureReplyText();
-      await bot.sendMessage(chatId, text);
+      await ctx.reply(text);
     } catch (err) {
-      await bot.sendMessage(chatId, `❌ Не удалось получить температуру: ${err.message}`).catch(() => {});
+      await ctx.reply(`❌ Не удалось получить температуру: ${err.message}`);
     }
   });
 
-  bot.onText(/\/start(?:@[\w_]+)?$/i, async (msg) => {
-    await bot
-      .sendMessage(
-        msg.chat.id,
-        'Бот мониторит температуру и шлёт алерты в настроенный чат.\n\n' +
-          'Команды:\n' +
-          '/temp — текущая температура с API'
-      )
-      .catch(() => {});
+  bot.command('start', async (ctx) => {
+    await ctx.reply(
+      'Бот мониторит температуру и шлёт алерты в настроенный чат MAX.\n\n' +
+        'Команды:\n' +
+        '/temp — текущая температура с API'
+    );
   });
 
-  bot.setMyCommands([{ command: 'temp', description: 'Текущая температура' }]).catch((err) => {
-    console.warn('setMyCommands:', err.message);
-  });
+  bot.api
+    .setMyCommands([
+      { name: 'temp', description: 'Текущая температура' },
+      { name: 'start', description: 'Справка' },
+    ])
+    .catch((err) => {
+      console.warn('setMyCommands:', err.message);
+    });
 }
 
 function sendAlert(message) {
-  bot.sendMessage(CHAT_ID, message).catch((err) => {
-    console.error('Ошибка отправки в Telegram:', err.message);
+  bot.api.sendMessageToChat(MAX_ALERT_CHAT_ID, message).catch((err) => {
+    console.error('Ошибка отправки в MAX:', err.message);
   });
 }
 
-/** @param {number} [delayMs] — если не задано, полный интервал 4 ч */
+/** @param {number} [delayMs] */
 function scheduleRepeatAlert(delayMs) {
   if (repeatAlertTimer) clearTimeout(repeatAlertTimer);
   const delay = delayMs !== undefined ? delayMs : REPEAT_ALERT_INTERVAL_MS;
@@ -156,7 +163,6 @@ function scheduleRepeatAlert(delayMs) {
   }, delay);
 }
 
-/** После перезапуска: следующий повтор через остаток от lastAlertAt */
 function restoreRepeatAlertTimerIfAlerting() {
   if (state !== 'ALERTING') return;
   if (lastAlertAt == null) {
@@ -193,8 +199,8 @@ async function checkTemperature() {
       savePersistedState();
       sendAlert(
         `🔥 Превышение температуры!\n` +
-        `Текущая: ${temp}°C (порог: ${TEMP_THRESHOLD}°C)\n` +
-        `Следующий алерт через 4 часа, если температура не снизится.`
+          `Текущая: ${temp}°C (порог: ${TEMP_THRESHOLD}°C)\n` +
+          `Следующий алерт через 4 часа, если температура не снизится.`
       );
       scheduleRepeatAlert();
     }
@@ -203,7 +209,7 @@ async function checkTemperature() {
 
   if (state === 'ALERTING') {
     if (isOver) {
-      // ничего не делаем — повторный алерт по таймеру раз в 4 часа
+      // повтор по таймеру
     } else {
       state = 'NORMAL';
       lastAlertAt = null;
@@ -211,19 +217,25 @@ async function checkTemperature() {
       cancelRepeatAlert();
       sendAlert(
         `✅ Температура в норме.\n` +
-        `Текущая: ${temp}°C (порог: ${TEMP_THRESHOLD}°C). Ожидаем следующего повышения.`
+          `Текущая: ${temp}°C (порог: ${TEMP_THRESHOLD}°C). Ожидаем следующего повышения.`
       );
     }
   }
 }
 
-function run() {
+async function run() {
   loadPersistedState();
   setupCommands();
   restoreRepeatAlertTimerIfAlerting();
-  console.log(`Мониторинг: ${TEMP_API_URL}, порог ${TEMP_THRESHOLD}°C, опрос каждые ${POLL_INTERVAL_MS / 1000} с, состояние: ${STATE_FILE}`);
+  console.log(
+    `Мониторинг: ${TEMP_API_URL}, порог ${TEMP_THRESHOLD}°C, опрос каждые ${POLL_INTERVAL_MS / 1000} с, алерты в чат ${MAX_ALERT_CHAT_ID}, состояние: ${STATE_FILE}`
+  );
   checkTemperature();
   setInterval(checkTemperature, POLL_INTERVAL_MS);
+  await bot.start();
 }
 
-run();
+run().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
